@@ -6,7 +6,7 @@ const cors = require("cors");
 const helmet = require("helmet");
 const pool = require("./config/database");
 const migrate = require("./database/migrate");
-
+const authRoutes = require("./routes/auth");
 const app = express();
 const PORT = process.env.PORT || 3000;
 
