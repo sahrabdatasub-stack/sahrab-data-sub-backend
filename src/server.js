@@ -1,5 +1,3 @@
-app.use("/api/v1/auth", authRoutes); 
-app.use("/api/v1", protectedRoutes);
 require("dotenv").config();
 
 const express = require("express");
@@ -8,13 +6,18 @@ const helmet = require("helmet");
 const pool = require("./config/database");
 const migrate = require("./database/migrate");
 const authRoutes = require("./routes/auth");
+const protectedRoutes = require("./routes/protected");
+
 const app = express();
 const PORT = process.env.PORT || 3000;
 
 app.use(helmet());
 app.use(cors());
 app.use(express.json({ limit: "1mb" }));
+
 app.use("/api/v1/auth", authRoutes);
+app.use("/api/v1", protectedRoutes);
+
 app.get("/", (req, res) => {
   res.json({
     name: "SAHRAB DATA SUB",
@@ -31,10 +34,7 @@ app.get("/health", (req, res) => {
 app.get("/ready", async (req, res) => {
   try {
     await pool.query("SELECT 1");
-    res.json({
-      status: "ready",
-      database: "connected"
-    });
+    res.json({ status: "ready", database: "connected" });
   } catch (error) {
     res.status(503).json({
       status: "not_ready",
@@ -53,7 +53,6 @@ app.use((req, res) => {
 async function startServer() {
   try {
     await migrate();
-
     app.listen(PORT, "0.0.0.0", () => {
       console.log(`SAHRAB DATA SUB API running on port ${PORT}`);
     });
