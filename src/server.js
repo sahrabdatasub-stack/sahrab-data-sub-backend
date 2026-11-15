@@ -1,4 +1,5 @@
-app.use("/api/v1/auth", authRoutes);
+app.use("/api/v1/auth", authRoutes); 
+app.use("/api/v1", protectedRoutes);
 require("dotenv").config();
 
 const express = require("express");
