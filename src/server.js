@@ -1,11 +1,11 @@
 require("dotenv").config();
-
+const transactionRoutes = require("./routes/transactions");
 const express = require("express");
 const cors = require("cors");
 const helmet = require("helmet");
-const pool = require("./config/database");
+const pool = require("./config/database");es/
 const migrate = require("./database/migrate");
-const authRoutes = require("./routes/auth");
+const authRoutes = require("./routauth");
 const protectedRoutes = require("./routes/protected");
 const walletRoutes = require("./routes/wallet");
 const app = express();
@@ -17,7 +17,8 @@ app.use(express.json({ limit: "1mb" }));
 
 app.use("/api/v1/auth", authRoutes);
 app.use("/api/v1", protectedRoutes);
-app.use("/api/v1/wallet", walletRoutes);
+app.use("/api/v1/wallet", walletRoutes) 
+app.use("/api/v1/transactions", transactionRoutes);
 app.get("/", (req, res) => {
   res.json({
     name: "SAHRAB DATA SUB",
