@@ -7,7 +7,7 @@ const pool = require("./config/database");
 const migrate = require("./database/migrate");
 const authRoutes = require("./routes/auth");
 const protectedRoutes = require("./routes/protected");
-
+const walletRoutes = require("./routes/wallet");
 const app = express();
 const PORT = process.env.PORT || 3000;
 
@@ -17,7 +17,7 @@ app.use(express.json({ limit: "1mb" }));
 
 app.use("/api/v1/auth", authRoutes);
 app.use("/api/v1", protectedRoutes);
-
+app.use("/api/v1/wallet", walletRoutes);
 app.get("/", (req, res) => {
   res.json({
     name: "SAHRAB DATA SUB",
