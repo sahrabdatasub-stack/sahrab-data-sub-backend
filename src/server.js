@@ -1,4 +1,4 @@
-
+const paymentRoutes = require("./routes/payments");
 require("dotenv").config();
 
 const express = require("express");
@@ -23,7 +23,7 @@ app.use("/api/v1/auth", authRoutes);
 app.use("/api/v1", protectedRoutes);
 app.use("/api/v1/wallet", walletRoutes);
 app.use("/api/v1/transactions", transactionRoutes);
-
+app.use("/api/v1/payments", paymentRoutes);
 app.get("/", (req, res) => {
   res.json({
     name: "SAHRAB DATA SUB",
