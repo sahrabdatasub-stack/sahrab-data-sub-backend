@@ -1,6 +1,8 @@
 
 CREATE EXTENSION IF NOT EXISTS pgcrypto;
 
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 CREATE TABLE IF NOT EXISTS users (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     full_name VARCHAR(150) NOT NULL,
@@ -9,8 +11,6 @@ CREATE TABLE IF NOT EXISTS users (
     password_hash TEXT NOT NULL,
     role VARCHAR(30) NOT NULL DEFAULT 'CUSTOMER',
     status VARCHAR(20) NOT NULL DEFAULT 'ACTIVE',
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     CONSTRAINT valid_user_status
       CHECK (status IN ('ACTIVE', 'SUSPENDED', 'PENDING'))
 );
@@ -59,3 +59,20 @@ ON transactions (user_id, created_at DESC);
 
 CREATE INDEX IF NOT EXISTS ledger_transaction_idx
 ON ledger_entries (transaction_id);
+
+-- DATA PURCHASE SAFETY FIELDS
+ALTER TABLE transactions
+ADD COLUMN IF NOT EXISTS idempotency_key VARCHAR(120);
+
+ALTER TABLE transactions
+ADD COLUMN IF NOT EXISTS metadata JSONB NOT NULL DEFAULT '{}'::jsonb;
+
+-- PREVENT DUPLICATE PURCHASE REQUESTS
+CREATE UNIQUE INDEX IF NOT EXISTS transactions_user_idempotency_unique
+ON transactions (user_id, idempotency_key)
+WHERE idempotency_key IS NOT NULL;
+
+-- SPEED UP PENDING TRANSACTION LOOKUPS
+CREATE INDEX IF NOT EXISTS transactions_pending_idx
+ON transactions (status, created_at)
+WHERE status = 'PENDING';
