@@ -1,5 +1,7 @@
 
 const express = require("express");
+const crypto = require("node:crypto");
+const pool = require("../config/database");
 const authenticateToken = require("../middleware/auth");
 
 const router = express.Router();
