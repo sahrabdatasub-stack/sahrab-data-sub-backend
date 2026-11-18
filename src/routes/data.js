@@ -415,6 +415,7 @@ router.get("/quote/:plan_id", authenticateToken, async (req, res) => {
 // DATA PURCHASE
 router.post("/purchase", authenticateToken, async (req, res) => {
   let transactionId;
+let transactionReference;
 
   try {
     const planId = String(req.body.plan_id || "").trim();
