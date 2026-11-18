@@ -131,13 +131,15 @@ async function fetchSupplierPlans() {
 // COMPANY PROFIT RATES
 function getProfitRate(network) {
   const rates = {
-    mtn: 5,
-    airtel: 5,
-    glo: 7
+    mtn: 10,
+    airtel: 10,
+    glo: 12,
+    "9mobile": 12
   };
 
   return rates[String(network).toLowerCase()];
 }
+
 
 // SERVER-SIDE PRICE CALCULATION
 function calculateQuote(plan) {
