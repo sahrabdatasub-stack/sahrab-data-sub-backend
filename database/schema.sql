@@ -76,3 +76,13 @@ WHERE idempotency_key IS NOT NULL;
 CREATE INDEX IF NOT EXISTS transactions_pending_idx
 ON transactions (status, created_at)
 WHERE status = 'PENDING';
+-- DATA PURCHASE REFUND PROTECTION
+
+ALTER TABLE transactions
+ADD COLUMN IF NOT EXISTS refund_of_transaction_id UUID
+REFERENCES transactions(id);
+
+-- Prevent multiple refunds for one transaction
+CREATE UNIQUE INDEX IF NOT EXISTS transactions_single_refund_unique
+ON transactions (refund_of_transaction_id)
+WHERE refund_of_transaction_id IS NOT NULL;
