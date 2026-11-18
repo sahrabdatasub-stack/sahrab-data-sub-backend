@@ -1,21 +1,16 @@
+
 const express = require("express");
-const crypto = require("node:crypto");
 const pool = require("../config/database");
 const authenticateToken = require("../middleware/auth");
 
 const router = express.Router();
 
-// VALIDATE NIGERIAN PHONE NUMBER
+// Nigerian phone validation
 function isValidNigerianPhone(phone) {
   return /^(?:\+234|234|0)[789][01]\d{8}$/.test(phone);
 }
 
-// GENERATE UNIQUE TRANSACTION REFERENCE
-function generateReference() {
-  return `SD${crypto.randomUUID().replace(/-/g, "")}`;
-}
-
-// CONVERT NAIRA TO KOBO SAFELY
+// Safe Naira to Kobo conversion
 function nairaToKobo(value) {
   const price = String(value ?? "");
 
@@ -32,49 +27,114 @@ function nairaToKobo(value) {
     ? kobo
     : null;
 }
-// GET AVAILABLE DATA PLANS FROM VTU AGENT
-router.get("/plans", authenticateToken, async (req, res) => {
-  try {
-    if (
-      process.env.VTUAGENT_ENABLED !== "true" ||
-      !process.env.VTUAGENT_API_KEY
-    ) {
-      return res.status(503).json({
-        success: false,
-        message: "Data supplier is not configured."
-      });
-    }
 
-    const baseUrl = (
-      process.env.VTUAGENT_BASE_URL || "https://api.vtuagent.com/v1"
-    ).replace(/\/+$/, "");
+// VTU AGENT CONFIGURATION
+function getSupplierConfig() {
+  if (
+    process.env.VTUAGENT_ENABLED !== "true" ||
+    !process.env.VTUAGENT_API_KEY
+  ) {
+    return null;
+  }
 
-    const response = await fetch(`${baseUrl}/data/plans`, {
+  return {
+    baseUrl: (
+      process.env.VTUAGENT_BASE_URL ||
+      "https://api.vtuagent.com/v1"
+    ).replace(/\/+$/, ""),
+    apiKey: process.env.VTUAGENT_API_KEY
+  };
+}
+
+// FETCH LIVE SUPPLIER DATA PLANS
+async function fetchSupplierPlans() {
+  const config = getSupplierConfig();
+
+  if (!config) {
+    throw new Error("SUPPLIER_NOT_CONFIGURED");
+  }
+
+  const response = await fetch(
+    `${config.baseUrl}/data/plans`,
+    {
       method: "GET",
       headers: {
-        Authorization: `Bearer ${process.env.VTUAGENT_API_KEY}`,
+        Authorization: `Bearer ${config.apiKey}`,
         Accept: "application/json"
       },
       signal: AbortSignal.timeout(20000)
-    });
-
-    const result = await response.json();
-
-    if (!response.ok) {
-      console.error("VTU Agent plans request failed:", response.status);
-
-      return res.status(502).json({
-        success: false,
-        message: "Unable to retrieve data plans from supplier."
-      });
     }
+  );
+
+  const result = await response.json();
+
+  if (!response.ok) {
+    throw new Error("SUPPLIER_PLANS_FAILED");
+  }
+
+  const plans = Array.isArray(result?.data)
+    ? result.data
+    : Array.isArray(result?.data?.data)
+      ? result.data.data
+      : [];
+
+  return plans;
+}
+
+// COMPANY PROFIT RATES
+function getProfitRate(network) {
+  const rates = {
+    mtn: 5,
+    airtel: 5,
+    glo: 7
+  };
+
+  return rates[String(network).toLowerCase()];
+}
+
+// CALCULATE CUSTOMER PRICE
+function calculateQuote(plan) {
+  const network = String(plan.network || "").toLowerCase();
+  const profitPercent = getProfitRate(network);
+
+  if (profitPercent === undefined) {
+    return null;
+  }
+
+  const supplierKobo = nairaToKobo(plan.price);
+
+  if (!supplierKobo) {
+    return null;
+  }
+
+  const sellingKobo = Math.ceil(
+    supplierKobo * (100 + profitPercent) / 100
+  );
+
+  return {
+    plan_id: String(plan.plan_id || plan.id),
+    plan_name: plan.plan_name || plan.name || "Data plan",
+    network,
+    supplier_price_naira: supplierKobo / 100,
+    profit_percent: profitPercent,
+    company_profit_naira:
+      (sellingKobo - supplierKobo) / 100,
+    selling_price_naira: sellingKobo / 100,
+    selling_price_kobo: sellingKobo,
+    currency: "NGN"
+  };
+}
+
+// GET DATA PLANS
+router.get("/plans", authenticateToken, async (req, res) => {
+  try {
+    const plans = await fetchSupplierPlans();
 
     return res.json({
       success: true,
       message: "Data plans retrieved successfully.",
-      plans: result
+      plans
     });
-
   } catch (error) {
     console.error("Data plans error:", error.message);
 
@@ -85,19 +145,9 @@ router.get("/plans", authenticateToken, async (req, res) => {
   }
 });
 
-// DATA PURCHASE QUOTE WITH COMPANY PROFIT
+// GET PRICE QUOTE
 router.get("/quote/:plan_id", authenticateToken, async (req, res) => {
   try {
-    if (
-      process.env.VTUAGENT_ENABLED !== "true" ||
-      !process.env.VTUAGENT_API_KEY
-    ) {
-      return res.status(503).json({
-        success: false,
-        message: "Data supplier is not configured."
-      });
-    }
-
     const planId = String(req.params.plan_id || "").trim();
 
     if (!planId || planId.length > 100) {
@@ -107,33 +157,7 @@ router.get("/quote/:plan_id", authenticateToken, async (req, res) => {
       });
     }
 
-    const baseUrl = (
-      process.env.VTUAGENT_BASE_URL ||
-      "https://api.vtuagent.com/v1"
-    ).replace(/\/+$/, "");
-
-    const response = await fetch(`${baseUrl}/data/plans`, {
-      headers: {
-        Authorization: `Bearer ${process.env.VTUAGENT_API_KEY}`,
-        Accept: "application/json"
-      },
-      signal: AbortSignal.timeout(20000)
-    });
-
-    const result = await response.json();
-
-    if (!response.ok) {
-      return res.status(502).json({
-        success: false,
-        message: "Unable to retrieve supplier plans."
-      });
-    }
-
-    const plans = Array.isArray(result?.data)
-      ? result.data
-      : Array.isArray(result?.data?.data)
-        ? result.data.data
-        : [];
+    const plans = await fetchSupplierPlans();
 
     const plan = plans.find(item =>
       String(item.plan_id || item.id) === planId
@@ -146,64 +170,19 @@ router.get("/quote/:plan_id", authenticateToken, async (req, res) => {
       });
     }
 
-    const network = String(plan.network || "").toLowerCase();
+    const quote = calculateQuote(plan);
 
-    const rates = {
-      mtn: 5,
-      airtel: 5,
-      glo: 7
-    };
-
-    const profitPercent = rates[network];
-
-    if (profitPercent === undefined) {
+    if (!quote) {
       return res.status(422).json({
         success: false,
-        message: "This network is not enabled for purchase."
+        message: "This network or plan is not enabled."
       });
     }
-
-    const supplierPrice = String(plan.price ?? "");
-
-    if (!/^\d+(?:\.\d{1,2})?$/.test(supplierPrice)) {
-      return res.status(502).json({
-        success: false,
-        message: "Invalid supplier price."
-      });
-    }
-
-    const [whole, fraction = ""] = supplierPrice.split(".");
-    const supplierKobo =
-      Number(whole) * 100 +
-      Number(fraction.padEnd(2, "0"));
-
-    if (!Number.isSafeInteger(supplierKobo) || supplierKobo <= 0) {
-      return res.status(502).json({
-        success: false,
-        message: "Invalid supplier price."
-      });
-    }
-
-    const sellingKobo = Math.ceil(
-      supplierKobo * (100 + profitPercent) / 100
-    );
-
-    const profitKobo = sellingKobo - supplierKobo;
 
     return res.json({
       success: true,
-      quote: {
-        plan_id: String(plan.plan_id || plan.id),
-        plan_name: plan.plan_name || plan.name || "Data plan",
-        network,
-        supplier_price_naira: supplierKobo / 100,
-        profit_percent: profitPercent,
-        company_profit_naira: profitKobo / 100,
-        selling_price_naira: sellingKobo / 100,
-        currency: "NGN"
-      }
+      quote
     });
-
   } catch (error) {
     console.error("Data quote error:", error.message);
 
@@ -214,7 +193,9 @@ router.get("/quote/:plan_id", authenticateToken, async (req, res) => {
   }
 });
 
-// DATA PURCHASE API — SAFE INITIAL VERSION
+// DATA PURCHASE
+// REAL PURCHASES MUST REMAIN DISABLED UNTIL
+// WALLET, LEDGER, REFUND AND STATUS PROCESSING ARE VERIFIED.
 router.post("/purchase", authenticateToken, async (req, res) => {
   try {
     const planId = String(req.body.plan_id || "").trim();
@@ -247,7 +228,6 @@ router.post("/purchase", authenticateToken, async (req, res) => {
       });
     }
 
-    // REAL PURCHASES REMAIN DISABLED DURING DEVELOPMENT
     if (process.env.DATA_PURCHASES_ENABLED !== "true") {
       return res.status(503).json({
         success: false,
@@ -259,7 +239,6 @@ router.post("/purchase", authenticateToken, async (req, res) => {
       success: false,
       message: "Purchase processing is not yet activated."
     });
-
   } catch (error) {
     console.error("Data purchase error:", error.message);
 
@@ -271,4 +250,3 @@ router.post("/purchase", authenticateToken, async (req, res) => {
 });
 
 module.exports = router;
-
