@@ -215,5 +215,61 @@ router.get("/quote/:plan_id", authenticateToken, async (req, res) => {
   }
 });
 
+// DATA PURCHASE API — SAFE INITIAL VERSION
+router.post("/purchase", authenticateToken, async (req, res) => {
+  try {
+    const planId = String(req.body.plan_id || "").trim();
+    const phone = String(req.body.phone || "").trim();
+    const idempotencyKey = String(
+      req.headers["idempotency-key"] || ""
+    ).trim();
+
+    if (!planId || planId.length > 100) {
+      return res.status(400).json({
+        success: false,
+        message: "Valid data plan ID is required."
+      });
+    }
+
+    if (!isValidNigerianPhone(phone)) {
+      return res.status(400).json({
+        success: false,
+        message: "Valid Nigerian phone number is required."
+      });
+    }
+
+    if (
+      idempotencyKey.length < 8 ||
+      idempotencyKey.length > 120
+    ) {
+      return res.status(400).json({
+        success: false,
+        message: "A valid Idempotency-Key header is required."
+      });
+    }
+
+    // REAL PURCHASES REMAIN DISABLED DURING DEVELOPMENT
+    if (process.env.DATA_PURCHASES_ENABLED !== "true") {
+      return res.status(503).json({
+        success: false,
+        message: "Data purchases are temporarily disabled."
+      });
+    }
+
+    return res.status(501).json({
+      success: false,
+      message: "Purchase processing is not yet activated."
+    });
+
+  } catch (error) {
+    console.error("Data purchase error:", error.message);
+
+    return res.status(500).json({
+      success: false,
+      message: "Unable to process data purchase."
+    });
+  }
+});
+
 module.exports = router;
 
