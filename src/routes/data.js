@@ -5,7 +5,7 @@ const pool = require("../config/database");
 const authenticateToken = require("../middleware/auth");
 
 const router = express.Router();
-Use Control + Shift + m to toggle the tab key moving focus. Alternatively, use esc then tab to move to the next interactive element on the page.
+
 // VALIDATE NIGERIAN PHONE NUMBER
 function isValidNigerianPhone(phone) {
   return /^(?:\+234|234|0)[789][01]\d{8}$/.test(phone);
