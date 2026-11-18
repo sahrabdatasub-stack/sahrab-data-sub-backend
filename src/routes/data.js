@@ -5,7 +5,34 @@ const pool = require("../config/database");
 const authenticateToken = require("../middleware/auth");
 
 const router = express.Router();
+Use Control + Shift + m to toggle the tab key moving focus. Alternatively, use esc then tab to move to the next interactive element on the page.
+// VALIDATE NIGERIAN PHONE NUMBER
+function isValidNigerianPhone(phone) {
+  return /^(?:\+234|234|0)[789][01]\d{8}$/.test(phone);
+}
 
+// GENERATE UNIQUE TRANSACTION REFERENCE
+function generateReference() {
+  return `SD${crypto.randomUUID().replace(/-/g, "")}`;
+}
+
+// CONVERT NAIRA TO KOBO SAFELY
+function nairaToKobo(value) {
+  const price = String(value ?? "");
+
+  if (!/^\d+(?:\.\d{1,2})?$/.test(price)) {
+    return null;
+  }
+
+  const [whole, fraction = ""] = price.split(".");
+  const kobo =
+    Number(whole) * 100 +
+    Number(fraction.padEnd(2, "0"));
+
+  return Number.isSafeInteger(kobo) && kobo > 0
+    ? kobo
+    : null;
+}
 // GET AVAILABLE DATA PLANS FROM VTU AGENT
 router.get("/plans", authenticateToken, async (req, res) => {
   try {
