@@ -5,7 +5,6 @@ const authenticateToken = require("../middleware/auth");
 
 const router = express.Router();
 
-// GET AUTHENTICATED USER TRANSACTION HISTORY
 router.get("/", authenticateToken, async (req, res) => {
   try {
     const result = await pool.query(
@@ -25,10 +24,11 @@ router.get("/", authenticateToken, async (req, res) => {
         ...tx,
         amount_kobo: Number(tx.amount_kobo),
         amount_naira: Number(tx.amount_kobo) / 100
-    console.error("Transaction history error:", error.message);
       }))
     });
+
   } catch (error) {
+    console.error("Transaction history error:", error.message);
 
     return res.status(500).json({
       success: false,
