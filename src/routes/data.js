@@ -29,6 +29,7 @@ function nairaToKobo(value) {
     : null;
 }
 
+// GENERATE UNIQUE REFERENCE
 function generateReference(prefix = "SD") {
   return prefix + crypto.randomUUID().replace(/-/g, "");
 }
@@ -168,7 +169,7 @@ function calculateQuote(plan) {
   };
 }
 
-// MARK PURCHASE AS SUCCESSFUL
+// MARK PURCHASE SUCCESSFUL
 async function markPurchaseSuccessful(transactionId) {
   await pool.query(
     `UPDATE transactions
@@ -187,7 +188,7 @@ async function markPurchaseSuccessful(transactionId) {
   );
 }
 
-// REFUND CUSTOMER EXACTLY ONCE
+// REFUND ONLY AFTER CONFIRMED FAILURE
 async function refundDataPurchase(transactionId, reason) {
   const client = await pool.connect();
 
@@ -218,7 +219,7 @@ async function refundDataPurchase(transactionId, reason) {
       };
     }
 
-    // Additional protection against duplicate refunds.
+    // Prevent duplicate refunds.
     const existingRefund = await client.query(
       `SELECT id
        FROM transactions
@@ -250,6 +251,10 @@ async function refundDataPurchase(transactionId, reason) {
     const wallet = walletResult.rows[0];
     const amount = Number(original.amount_kobo);
 
+    if (!Number.isSafeInteger(amount) || amount <= 0) {
+      throw new Error("INVALID_REFUND_AMOUNT");
+    }
+
     // Return money to customer wallet.
     await client.query(
       `UPDATE wallets
@@ -259,9 +264,9 @@ async function refundDataPurchase(transactionId, reason) {
       [amount, wallet.id]
     );
 
-    // Create a separate refund transaction.
     const refundReference = generateReference("SDR");
 
+    // Create separate refund transaction.
     const refundResult = await client.query(
       `INSERT INTO transactions
        (
@@ -275,8 +280,10 @@ async function refundDataPurchase(transactionId, reason) {
          refund_of_transaction_id,
          metadata
        )
-       VALUES ($1, $2, 'DATA_PURCHASE_REFUND', $3,
-               'SUCCESSFUL', 'VTUAGENT', $4, $5, $6::jsonb)
+       VALUES (
+         $1, $2, 'DATA_PURCHASE_REFUND', $3,
+         'SUCCESSFUL', 'VTUAGENT', $4, $5, $6::jsonb
+       )
        RETURNING id`,
       [
         original.user_id,
@@ -392,7 +399,7 @@ router.get("/quote/:plan_id", authenticateToken, async (req, res) => {
       success: true,
       quote: {
         plan_id: quote.plan_id,
-        plan_name: plan.plan_name || plan.name || "Data plan",
+        plan_name: quote.plan_name,
         network: quote.network,
         supplier_price_naira: quote.supplier_price_kobo / 100,
         profit_percent: quote.profit_percent,
@@ -415,7 +422,7 @@ router.get("/quote/:plan_id", authenticateToken, async (req, res) => {
 // DATA PURCHASE
 router.post("/purchase", authenticateToken, async (req, res) => {
   let transactionId;
-let transactionReference;
+  let transactionReference;
 
   try {
     const planId = String(req.body.plan_id || "").trim();
@@ -552,7 +559,7 @@ let transactionReference;
         });
       }
 
-      const reference = generateReference("SD");
+      transactionReference = generateReference("SD");
 
       const metadata = {
         plan_id: planId,
@@ -562,7 +569,7 @@ let transactionReference;
         supplier_price_kobo: quote.supplier_price_kobo,
         profit_percent: quote.profit_percent,
         company_profit_kobo: quote.company_profit_kobo,
-        supplier_request_ref: reference
+        supplier_request_ref: transactionReference
       };
 
       const transactionResult = await client.query(
@@ -584,7 +591,7 @@ let transactionReference;
          RETURNING id`,
         [
           req.user.id,
-          reference,
+          transactionReference,
           amount,
           `Data purchase for ${phone}`,
           idempotencyKey,
@@ -638,33 +645,29 @@ let transactionReference;
         {
           plan_id: planId,
           phone,
-          request_ref: (
-            await pool.query(
-              "SELECT reference FROM transactions WHERE id = $1",
-              [transactionId]
-            )
-          ).rows[0].reference
+          request_ref: transactionReference
         }
       );
     } catch (error) {
-      // A timeout is uncertain. Do not refund automatically.
-      console.error("Supplier purchase outcome uncertain:", error.message);
+      // Uncertain outcome: do not refund automatically.
+      console.error(
+        "Supplier purchase outcome uncertain:",
+        error.message
+      );
 
       return res.status(202).json({
         success: true,
         status: "PENDING",
-        reference: (
-          await pool.query(
-            "SELECT reference FROM transactions WHERE id = $1",
-            [transactionId]
-          )
-        ).rows[0].reference,
+        reference: transactionReference,
         message: "Purchase is being verified. Do not submit it again."
       });
     }
 
-    const supplierStatus = supplierResult.data.status;
+    const supplierStatus = String(
+      supplierResult.data.status || ""
+    ).toLowerCase();
 
+    // Confirmed success.
     if (
       supplierResult.httpStatus === 200 &&
       supplierStatus === "successful"
@@ -674,11 +677,12 @@ let transactionReference;
       return res.json({
         success: true,
         status: "SUCCESSFUL",
-        reference: supplierResult.data.reference,
+        reference: transactionReference,
         message: "Data purchase successful."
       });
     }
 
+    // Supplier is still processing.
     if (
       supplierResult.httpStatus === 202 ||
       supplierStatus === "pending"
@@ -686,34 +690,45 @@ let transactionReference;
       return res.status(202).json({
         success: true,
         status: "PENDING",
-        reference: supplierResult.data.reference,
+        reference: transactionReference,
         message: "Data purchase is still processing."
       });
     }
 
+    // Refund only when supplier explicitly confirms failure.
     if (
       supplierResult.httpStatus === 424 ||
-      supplierStatus === "failed" ||
-      [400, 401, 500].includes(supplierResult.httpStatus)
+      supplierStatus === "failed"
     ) {
       const refund = await refundDataPurchase(
         transactionId,
-        supplierResult.data.message || "Supplier rejected purchase"
+        supplierResult.data.message || "Supplier confirmed purchase failure"
       );
 
       return res.status(502).json({
         success: false,
         status: "FAILED",
+        reference: transactionReference,
         refunded: refund.refunded,
-        message: "Data purchase failed. Wallet refund has been processed."
+        message: refund.refunded
+          ? "Data purchase failed. Wallet refund has been processed."
+          : "Data purchase failed. Please check your transaction history."
       });
     }
 
-    // Unknown response: retain pending status for reconciliation.
+    // Unknown responses, including HTTP 400/401/500:
+    // keep the transaction pending until status is confirmed.
+    console.error(
+      "Unconfirmed supplier response:",
+      supplierResult.httpStatus,
+      supplierStatus
+    );
+
     return res.status(202).json({
       success: true,
       status: "PENDING",
-      message: "Purchase outcome is being verified. Do not submit again."
+      reference: transactionReference,
+      message: "Purchase outcome is being verified. Do not submit it again."
     });
 
   } catch (error) {
@@ -730,6 +745,13 @@ let transactionReference;
 router.get("/status/:reference", authenticateToken, async (req, res) => {
   try {
     const reference = String(req.params.reference || "").trim();
+
+    if (!reference || reference.length > 120) {
+      return res.status(400).json({
+        success: false,
+        message: "Valid transaction reference is required."
+      });
+    }
 
     const result = await pool.query(
       `SELECT id, reference, type, amount_kobo, status
@@ -758,19 +780,24 @@ router.get("/status/:reference", authenticateToken, async (req, res) => {
       });
     }
 
+    // Query supplier using our own transaction reference.
     const supplierResult = await supplierRequest(
       "/transaction/status",
       { request_ref: transaction.reference }
     );
 
+    const supplierStatus = String(
+      supplierResult.data.status || ""
+    ).toLowerCase();
+
     if (
       supplierResult.httpStatus === 200 &&
-      supplierResult.data.status === "successful"
+      supplierStatus === "successful"
     ) {
       await markPurchaseSuccessful(transaction.id);
     } else if (
       supplierResult.httpStatus === 424 ||
-      supplierResult.data.status === "failed"
+      supplierStatus === "failed"
     ) {
       await refundDataPurchase(
         transaction.id,
@@ -778,6 +805,7 @@ router.get("/status/:reference", authenticateToken, async (req, res) => {
       );
     }
 
+    // Read the latest saved transaction state.
     const latest = await pool.query(
       `SELECT reference, status, amount_kobo
        FROM transactions
@@ -790,7 +818,7 @@ router.get("/status/:reference", authenticateToken, async (req, res) => {
       reference: latest.rows[0].reference,
       status: latest.rows[0].status,
       amount_naira: Number(latest.rows[0].amount_kobo) / 100,
-      supplier_status: supplierResult.data.status || "unknown"
+      supplier_status: supplierStatus || "unknown"
     });
 
   } catch (error) {
