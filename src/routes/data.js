@@ -4,132 +4,31 @@ const crypto = require("node:crypto");
 const pool = require("../config/database");
 const authenticateToken = require("../middleware/auth");
 
+const {
+  getDataPlans,
+  purchaseData,
+  getDataStatus,
+  normalizeNetwork,
+  MeleDataError
+} = require("../meleData");
+
 const router = express.Router();
 
-// NIGERIAN PHONE VALIDATION
-function isValidNigerianPhone(phone) {
-  return /^(?:\+234|234|0)[789][01]\d{8}$/.test(phone);
-}
-
-// SAFE NAIRA TO KOBO CONVERSION
-function nairaToKobo(value) {
-  const price = String(value ?? "");
-
-  if (!/^\d+(?:\.\d{1,2})?$/.test(price)) {
-    return null;
-  }
-
-  const [whole, fraction = ""] = price.split(".");
-  const kobo =
-    Number(whole) * 100 +
-    Number(fraction.padEnd(2, "0"));
-
-  return Number.isSafeInteger(kobo) && kobo > 0
-    ? kobo
-    : null;
-}
-
-// GENERATE UNIQUE REFERENCE
 function generateReference(prefix = "SD") {
   return prefix + crypto.randomUUID().replace(/-/g, "");
 }
 
-// SUPPLIER CONFIGURATION
-function getSupplierConfig() {
-  if (
-    process.env.VTUAGENT_ENABLED !== "true" ||
-    !process.env.VTUAGENT_API_KEY
-  ) {
-    return null;
-  }
+function normalizePhone(value) {
+  const phone = String(value ?? "").trim();
 
-  return {
-    baseUrl: (
-      process.env.VTUAGENT_BASE_URL ||
-      "https://api.vtuagent.com/v1"
-    ).replace(/\/+$/, ""),
-    apiKey: process.env.VTUAGENT_API_KEY
-  };
+  if (/^0[789][01]\d{8}$/.test(phone)) return phone;
+  if (/^234[789][01]\d{8}$/.test(phone)) return `0${phone.slice(3)}`;
+  if (/^\+234[789][01]\d{8}$/.test(phone)) return `0${phone.slice(4)}`;
+
+  return null;
 }
 
-// SUPPLIER REQUEST
-async function supplierRequest(path, body) {
-  const config = getSupplierConfig();
-
-  if (!config) {
-    throw new Error("SUPPLIER_NOT_CONFIGURED");
-  }
-
-  const response = await fetch(`${config.baseUrl}${path}`, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${config.apiKey}`,
-      "Content-Type": "application/json",
-      Accept: "application/json"
-    },
-    body: JSON.stringify(body),
-    signal: AbortSignal.timeout(20000)
-  });
-
-  let data = {};
-
-  try {
-    data = await response.json();
-  } catch {
-    data = {};
-  }
-
-  return {
-    httpStatus: response.status,
-    data
-  };
-}
-
-// FETCH LIVE DATA PLANS
-async function fetchSupplierPlans() {
-  const config = getSupplierConfig();
-
-  if (!config) {
-    throw new Error("SUPPLIER_NOT_CONFIGURED");
-  }
-
-  const response = await fetch(
-    `${config.baseUrl}/data/plans`,
-    {
-      method: "GET",
-      headers: {
-        Authorization: `Bearer ${config.apiKey}`,
-        Accept: "application/json"
-      },
-      signal: AbortSignal.timeout(20000)
-    }
-  );
-
-  let result = {};
-
-  try {
-    result = await response.json();
-  } catch {
-    throw new Error("INVALID_SUPPLIER_RESPONSE");
-  }
-
-  if (!response.ok) {
-    throw new Error("SUPPLIER_PLANS_FAILED");
-  }
-
-  if (Array.isArray(result?.data)) {
-    return result.data;
-  }
-
-  if (Array.isArray(result?.data?.data)) {
-    return result.data.data;
-  }
-
-  throw new Error("INVALID_SUPPLIER_PLANS");
-}
-
-// COMPANY PROFIT RATES
-function getProfitRate(network) {
+function calculateQuote(plan) {
   const rates = {
     mtn: 10,
     airtel: 10,
@@ -137,60 +36,84 @@ function getProfitRate(network) {
     "9mobile": 12
   };
 
-  return rates[String(network).toLowerCase()];
-}
+  const network = normalizeNetwork(plan.network);
+  const rate = rates[network];
 
+  const supplierKobo = Number(plan.supplier_price_kobo);
 
-// SERVER-SIDE PRICE CALCULATION
-function calculateQuote(plan) {
-  const network = String(plan.network || "").toLowerCase();
-  const profitPercent = getProfitRate(network);
-
-  if (profitPercent === undefined) {
-    return null;
-  }
-
-  const supplierKobo = nairaToKobo(plan.price);
-
-  if (!supplierKobo) {
+  if (
+    !network ||
+    rate === undefined ||
+    !Number.isSafeInteger(supplierKobo) ||
+    supplierKobo <= 0
+  ) {
     return null;
   }
 
   const sellingKobo = Math.ceil(
-    supplierKobo * (100 + profitPercent) / 100
+    supplierKobo * (100 + rate) / 100
   );
 
   return {
-    plan_id: String(plan.plan_id || plan.id),
-    plan_name: plan.plan_name || plan.name || "Data plan",
+    plan_id: String(plan.plan_id),
+    plan_name: plan.plan_name,
     network,
     supplier_price_kobo: supplierKobo,
-    profit_percent: profitPercent,
+    profit_percent: rate,
     selling_price_kobo: sellingKobo,
     company_profit_kobo: sellingKobo - supplierKobo
   };
 }
 
-// MARK PURCHASE SUCCESSFUL
-async function markPurchaseSuccessful(transactionId) {
+function getSupplierStatus(body) {
+  const value =
+    body?.data?.status ??
+    body?.data?.data?.status ??
+    body?.transaction?.status ??
+    body?.status;
+
+  if (value === true) return "success";
+
+  const status = String(value ?? "").trim().toLowerCase();
+
+  if (["success", "successful", "completed"].includes(status)) {
+    return "success";
+  }
+
+  if (["failed", "failure", "unsuccessful", "rejected"].includes(status)) {
+    return "failed";
+  }
+
+  if (["pending", "processing", "initiated"].includes(status)) {
+    return "pending";
+  }
+
+  return "unknown";
+}
+
+async function markPurchaseSuccessful(transactionId, supplierResponse) {
   await pool.query(
     `UPDATE transactions
      SET status = 'SUCCESSFUL',
          updated_at = NOW(),
-         metadata = metadata || $2::jsonb
+         metadata = COALESCE(metadata, '{}'::jsonb) || $2::jsonb
      WHERE id = $1
        AND status = 'PENDING'`,
     [
       transactionId,
       JSON.stringify({
         supplier_confirmed: true,
+        supplier_reference:
+          supplierResponse?.data?.reference ??
+          supplierResponse?.reference ??
+          null,
+        supplier_status: "success",
         settled_at: new Date().toISOString()
       })
     ]
   );
 }
 
-// REFUND ONLY AFTER CONFIRMED FAILURE
 async function refundDataPurchase(transactionId, reason) {
   const client = await pool.connect();
 
@@ -205,13 +128,12 @@ async function refundDataPurchase(transactionId, reason) {
       [transactionId]
     );
 
-    if (originalResult.rows.length === 0) {
+    if (!originalResult.rows.length) {
       throw new Error("ORIGINAL_TRANSACTION_NOT_FOUND");
     }
 
     const original = originalResult.rows[0];
 
-    // Never refund a successful or already failed transaction.
     if (original.status !== "PENDING") {
       await client.query("COMMIT");
 
@@ -221,7 +143,6 @@ async function refundDataPurchase(transactionId, reason) {
       };
     }
 
-    // Prevent duplicate refunds.
     const existingRefund = await client.query(
       `SELECT id
        FROM transactions
@@ -229,7 +150,7 @@ async function refundDataPurchase(transactionId, reason) {
       [original.id]
     );
 
-    if (existingRefund.rows.length > 0) {
+    if (existingRefund.rows.length) {
       await client.query("COMMIT");
 
       return {
@@ -238,37 +159,34 @@ async function refundDataPurchase(transactionId, reason) {
       };
     }
 
-    const walletResult = await client.query(
-      `SELECT id, balance_kobo
-       FROM wallets
-       WHERE user_id = $1
-       FOR UPDATE`,
-      [original.user_id]
-    );
-
-    if (walletResult.rows.length === 0) {
-      throw new Error("REFUND_WALLET_NOT_FOUND");
-    }
-
-    const wallet = walletResult.rows[0];
     const amount = Number(original.amount_kobo);
 
     if (!Number.isSafeInteger(amount) || amount <= 0) {
       throw new Error("INVALID_REFUND_AMOUNT");
     }
 
-    // Return money to customer wallet.
+    const walletResult = await client.query(
+      `SELECT id
+       FROM wallets
+       WHERE user_id = $1
+       FOR UPDATE`,
+      [original.user_id]
+    );
+
+    if (!walletResult.rows.length) {
+      throw new Error("REFUND_WALLET_NOT_FOUND");
+    }
+
     await client.query(
       `UPDATE wallets
        SET balance_kobo = balance_kobo + $1,
            updated_at = NOW()
        WHERE id = $2`,
-      [amount, wallet.id]
+      [amount, walletResult.rows[0].id]
     );
 
     const refundReference = generateReference("SDR");
 
-    // Create separate refund transaction.
     const refundResult = await client.query(
       `INSERT INTO transactions
        (
@@ -282,10 +200,9 @@ async function refundDataPurchase(transactionId, reason) {
          refund_of_transaction_id,
          metadata
        )
-       VALUES (
-         $1, $2, 'DATA_PURCHASE_REFUND', $3,
-         'SUCCESSFUL', 'VTUAGENT', $4, $5, $6::jsonb
-       )
+       VALUES
+       ($1, $2, 'DATA_PURCHASE_REFUND', $3,
+        'SUCCESSFUL', 'MELE', $4, $5, $6::jsonb)
        RETURNING id`,
       [
         original.user_id,
@@ -302,7 +219,6 @@ async function refundDataPurchase(transactionId, reason) {
 
     const refundId = refundResult.rows[0].id;
 
-    // Reverse the original ledger entries.
     await client.query(
       `INSERT INTO ledger_entries
        (transaction_id, account_code, entry_type, amount_kobo)
@@ -316,7 +232,7 @@ async function refundDataPurchase(transactionId, reason) {
       `UPDATE transactions
        SET status = 'FAILED',
            updated_at = NOW(),
-           metadata = metadata || $2::jsonb
+           metadata = COALESCE(metadata, '{}'::jsonb) || $2::jsonb
        WHERE id = $1`,
       [
         original.id,
@@ -346,19 +262,48 @@ async function refundDataPurchase(transactionId, reason) {
 // GET DATA PLANS
 router.get("/plans", authenticateToken, async (req, res) => {
   try {
-    const plans = await fetchSupplierPlans();
+    const network = req.query.network
+      ? normalizeNetwork(req.query.network)
+      : null;
+
+    if (req.query.network && !network) {
+      return res.status(400).json({
+        success: false,
+        message: "Unsupported network."
+      });
+    }
+
+    const plans = await getDataPlans(network || undefined);
+
+    const availablePlans = plans
+      .filter(plan => plan.is_active !== false)
+      .map(plan => {
+        const quote = calculateQuote(plan);
+
+        if (!quote) return null;
+
+        return {
+          plan_id: quote.plan_id,
+          plan_name: quote.plan_name,
+          network: quote.network,
+          supplier_price_naira: quote.supplier_price_kobo / 100,
+          selling_price_naira: quote.selling_price_kobo / 100,
+          profit_percent: quote.profit_percent,
+          currency: "NGN"
+        };
+      })
+      .filter(Boolean);
 
     return res.json({
       success: true,
-      message: "Data plans retrieved successfully.",
-      plans
+      plans: availablePlans
     });
   } catch (error) {
-    console.error("Data plans error:", error.message);
+    console.error("MELE plans error:", error.message);
 
     return res.status(502).json({
       success: false,
-      message: "Data supplier is temporarily unavailable."
+      message: "Unable to retrieve data plans."
     });
   }
 });
@@ -375,13 +320,13 @@ router.get("/quote/:plan_id", authenticateToken, async (req, res) => {
       });
     }
 
-    const plans = await fetchSupplierPlans();
+    const plans = await getDataPlans();
 
-    const plan = plans.find(item =>
-      String(item.plan_id || item.id) === planId
+    const plan = plans.find(
+      item => String(item.plan_id) === planId
     );
 
-    if (!plan || plan.is_active === false) {
+    if (!plan) {
       return res.status(404).json({
         success: false,
         message: "Data plan unavailable."
@@ -393,26 +338,22 @@ router.get("/quote/:plan_id", authenticateToken, async (req, res) => {
     if (!quote) {
       return res.status(422).json({
         success: false,
-        message: "This network or plan is not enabled."
+        message: "This plan is not enabled."
       });
     }
 
     return res.json({
       success: true,
       quote: {
-        plan_id: quote.plan_id,
-        plan_name: quote.plan_name,
-        network: quote.network,
+        ...quote,
         supplier_price_naira: quote.supplier_price_kobo / 100,
-        profit_percent: quote.profit_percent,
-        company_profit_naira: quote.company_profit_kobo / 100,
         selling_price_naira: quote.selling_price_kobo / 100,
-        selling_price_kobo: quote.selling_price_kobo,
+        company_profit_naira: quote.company_profit_kobo / 100,
         currency: "NGN"
       }
     });
   } catch (error) {
-    console.error("Data quote error:", error.message);
+    console.error("MELE quote error:", error.message);
 
     return res.status(502).json({
       success: false,
@@ -421,14 +362,14 @@ router.get("/quote/:plan_id", authenticateToken, async (req, res) => {
   }
 });
 
-// DATA PURCHASE
+// PURCHASE DATA
 router.post("/purchase", authenticateToken, async (req, res) => {
   let transactionId;
   let transactionReference;
 
   try {
-    const planId = String(req.body.plan_id || "").trim();
-    const phone = String(req.body.phone || "").trim();
+    const planId = String(req.body?.plan_id ?? "").trim();
+    const phone = normalizePhone(req.body?.phone);
     const idempotencyKey = String(
       req.headers["idempotency-key"] || ""
     ).trim();
@@ -440,24 +381,20 @@ router.post("/purchase", authenticateToken, async (req, res) => {
       });
     }
 
-    if (!isValidNigerianPhone(phone)) {
+    if (!phone) {
       return res.status(400).json({
         success: false,
         message: "Valid Nigerian phone number is required."
       });
     }
 
-    if (
-      idempotencyKey.length < 8 ||
-      idempotencyKey.length > 120
-    ) {
+    if (idempotencyKey.length < 8 || idempotencyKey.length > 120) {
       return res.status(400).json({
         success: false,
         message: "A valid Idempotency-Key header is required."
       });
     }
 
-    // Keep real purchases disabled until final testing.
     if (process.env.DATA_PURCHASES_ENABLED !== "true") {
       return res.status(503).json({
         success: false,
@@ -465,13 +402,13 @@ router.post("/purchase", authenticateToken, async (req, res) => {
       });
     }
 
-    const plans = await fetchSupplierPlans();
+    const plans = await getDataPlans();
 
-    const plan = plans.find(item =>
-      String(item.plan_id || item.id) === planId
+    const plan = plans.find(
+      item => String(item.plan_id) === planId
     );
 
-    if (!plan || plan.is_active === false) {
+    if (!plan) {
       return res.status(404).json({
         success: false,
         message: "Data plan unavailable."
@@ -483,7 +420,7 @@ router.post("/purchase", authenticateToken, async (req, res) => {
     if (!quote) {
       return res.status(422).json({
         success: false,
-        message: "This network or plan is not enabled."
+        message: "This data plan is not enabled."
       });
     }
 
@@ -492,7 +429,6 @@ router.post("/purchase", authenticateToken, async (req, res) => {
     try {
       await client.query("BEGIN");
 
-      // Check whether this request was already submitted.
       const existingResult = await client.query(
         `SELECT id, reference, status, amount_kobo, metadata
          FROM transactions
@@ -502,7 +438,7 @@ router.post("/purchase", authenticateToken, async (req, res) => {
         [req.user.id, idempotencyKey]
       );
 
-      if (existingResult.rows.length > 0) {
+      if (existingResult.rows.length) {
         const existing = existingResult.rows[0];
         const metadata = existing.metadata || {};
 
@@ -530,7 +466,6 @@ router.post("/purchase", authenticateToken, async (req, res) => {
         });
       }
 
-      // Lock wallet to prevent simultaneous overspending.
       const walletResult = await client.query(
         `SELECT id, balance_kobo
          FROM wallets
@@ -539,7 +474,7 @@ router.post("/purchase", authenticateToken, async (req, res) => {
         [req.user.id]
       );
 
-      if (walletResult.rows.length === 0) {
+      if (!walletResult.rows.length) {
         await client.query("ROLLBACK");
 
         return res.status(404).json({
@@ -589,7 +524,7 @@ router.post("/purchase", authenticateToken, async (req, res) => {
          )
          VALUES
          ($1, $2, 'DATA_PURCHASE', $3, 'PENDING',
-          'VTUAGENT', $4, $5, $6::jsonb)
+          'MELE', $4, $5, $6::jsonb)
          RETURNING id`,
         [
           req.user.id,
@@ -603,7 +538,6 @@ router.post("/purchase", authenticateToken, async (req, res) => {
 
       transactionId = transactionResult.rows[0].id;
 
-      // Debit customer wallet.
       await client.query(
         `UPDATE wallets
          SET balance_kobo = balance_kobo - $1,
@@ -612,7 +546,6 @@ router.post("/purchase", authenticateToken, async (req, res) => {
         [amount, wallet.id]
       );
 
-      // Balanced purchase ledger.
       await client.query(
         `INSERT INTO ledger_entries
          (transaction_id, account_code, entry_type, amount_kobo)
@@ -638,24 +571,18 @@ router.post("/purchase", authenticateToken, async (req, res) => {
       client.release();
     }
 
-    // Supplier call happens only after database commit.
-    let supplierResult;
+    // Send the purchase to MELE only after the local transaction commits.
+    let supplierResponse;
 
     try {
-      supplierResult = await supplierRequest(
-        "/data/purchase",
-        {
-          plan_id: planId,
-          phone,
-          request_ref: transactionReference
-        }
-      );
+      supplierResponse = await purchaseData({
+        phone,
+        plan: planId,
+        network: quote.network,
+        requestId: transactionReference
+      });
     } catch (error) {
-      // Uncertain outcome: do not refund automatically.
-      console.error(
-        "Supplier purchase outcome uncertain:",
-        error.message
-      );
+      console.error("MELE purchase outcome uncertain:", error.message);
 
       return res.status(202).json({
         success: true,
@@ -665,16 +592,10 @@ router.post("/purchase", authenticateToken, async (req, res) => {
       });
     }
 
-    const supplierStatus = String(
-      supplierResult.data.status || ""
-    ).toLowerCase();
+    const supplierStatus = getSupplierStatus(supplierResponse);
 
-    // Confirmed success.
-    if (
-      supplierResult.httpStatus === 200 &&
-      supplierStatus === "successful"
-    ) {
-      await markPurchaseSuccessful(transactionId);
+    if (supplierStatus === "success") {
+      await markPurchaseSuccessful(transactionId, supplierResponse);
 
       return res.json({
         success: true,
@@ -684,27 +605,10 @@ router.post("/purchase", authenticateToken, async (req, res) => {
       });
     }
 
-    // Supplier is still processing.
-    if (
-      supplierResult.httpStatus === 202 ||
-      supplierStatus === "pending"
-    ) {
-      return res.status(202).json({
-        success: true,
-        status: "PENDING",
-        reference: transactionReference,
-        message: "Data purchase is still processing."
-      });
-    }
-
-    // Refund only when supplier explicitly confirms failure.
-    if (
-      supplierResult.httpStatus === 424 ||
-      supplierStatus === "failed"
-    ) {
+    if (supplierStatus === "failed") {
       const refund = await refundDataPurchase(
         transactionId,
-        supplierResult.data.message || "Supplier confirmed purchase failure"
+        supplierResponse?.message || "MELE confirmed purchase failure"
       );
 
       return res.status(502).json({
@@ -713,26 +617,17 @@ router.post("/purchase", authenticateToken, async (req, res) => {
         reference: transactionReference,
         refunded: refund.refunded,
         message: refund.refunded
-          ? "Data purchase failed. Wallet refund has been processed."
-          : "Data purchase failed. Please check your transaction history."
+          ? "Purchase failed. Wallet refund processed."
+          : "Purchase failed. Check your transaction history."
       });
     }
-
-    // Unknown responses, including HTTP 400/401/500:
-    // keep the transaction pending until status is confirmed.
-    console.error(
-      "Unconfirmed supplier response:",
-      supplierResult.httpStatus,
-      supplierStatus
-    );
 
     return res.status(202).json({
       success: true,
       status: "PENDING",
       reference: transactionReference,
-      message: "Purchase outcome is being verified. Do not submit it again."
+      message: "Purchase is still being verified. Do not submit it again."
     });
-
   } catch (error) {
     console.error("Data purchase error:", error.message);
 
@@ -743,7 +638,7 @@ router.post("/purchase", authenticateToken, async (req, res) => {
   }
 });
 
-// CHECK PENDING PURCHASE STATUS
+// CHECK PURCHASE STATUS
 router.get("/status/:reference", authenticateToken, async (req, res) => {
   try {
     const reference = String(req.params.reference || "").trim();
@@ -756,7 +651,7 @@ router.get("/status/:reference", authenticateToken, async (req, res) => {
     }
 
     const result = await pool.query(
-      `SELECT id, reference, type, amount_kobo, status
+      `SELECT id, reference, type, amount_kobo, status, metadata
        FROM transactions
        WHERE reference = $1
          AND user_id = $2
@@ -764,7 +659,7 @@ router.get("/status/:reference", authenticateToken, async (req, res) => {
       [reference, req.user.id]
     );
 
-    if (result.rows.length === 0) {
+    if (!result.rows.length) {
       return res.status(404).json({
         success: false,
         message: "Data purchase not found."
@@ -782,32 +677,42 @@ router.get("/status/:reference", authenticateToken, async (req, res) => {
       });
     }
 
-    // Query supplier using our own transaction reference.
-    const supplierResult = await supplierRequest(
-      "/transaction/status",
-      { request_ref: transaction.reference }
-    );
+    const metadata = transaction.metadata || {};
 
-    const supplierStatus = String(
-      supplierResult.data.status || ""
-    ).toLowerCase();
+    const supplierReference =
+      metadata.supplier_reference ||
+      metadata.supplier_request_ref ||
+      transaction.reference;
 
-    if (
-      supplierResult.httpStatus === 200 &&
-      supplierStatus === "successful"
-    ) {
-      await markPurchaseSuccessful(transaction.id);
-    } else if (
-      supplierResult.httpStatus === 424 ||
-      supplierStatus === "failed"
-    ) {
+    let supplierResponse;
+
+    try {
+      supplierResponse = await getDataStatus(supplierReference);
+    } catch (error) {
+      console.error("MELE status check error:", error.message);
+
+      return res.status(202).json({
+        success: true,
+        reference,
+        status: "PENDING",
+        message: "Unable to confirm the result yet. Please try again."
+      });
+    }
+
+    const supplierStatus = getSupplierStatus(supplierResponse);
+
+    if (supplierStatus === "success") {
+      await markPurchaseSuccessful(
+        transaction.id,
+        supplierResponse
+      );
+    } else if (supplierStatus === "failed") {
       await refundDataPurchase(
         transaction.id,
-        supplierResult.data.message || "Supplier confirmed failure"
+        supplierResponse?.message || "MELE confirmed purchase failure"
       );
     }
 
-    // Read the latest saved transaction state.
     const latest = await pool.query(
       `SELECT reference, status, amount_kobo
        FROM transactions
@@ -820,15 +725,14 @@ router.get("/status/:reference", authenticateToken, async (req, res) => {
       reference: latest.rows[0].reference,
       status: latest.rows[0].status,
       amount_naira: Number(latest.rows[0].amount_kobo) / 100,
-      supplier_status: supplierStatus || "unknown"
+      supplier_status: supplierStatus
     });
-
   } catch (error) {
     console.error("Data status error:", error.message);
 
-    return res.status(502).json({
+    return res.status(500).json({
       success: false,
-      message: "Unable to verify data purchase status. Please try again."
+      message: "Unable to verify data purchase status."
     });
   }
 });
